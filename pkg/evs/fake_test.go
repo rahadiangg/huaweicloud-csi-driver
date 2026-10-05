@@ -204,3 +204,5 @@ func fastPoll(condition wait.ConditionFunc) error {
 	}
 	return wait.ErrWaitTimeout
 }
+
+func cloudvolumesVolume() cloudvolumes.Volume { return cloudvolumes.Volume{Status: "in-use", Size: 10} }

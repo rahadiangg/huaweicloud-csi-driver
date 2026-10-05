@@ -42,8 +42,7 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	volumeCapability := req.GetVolumeCapability()
 	volumeID := req.GetVolumeId()
 
-	vol, err := nodeStageValidation(api, volumeID, stagingTarget, volumeCapability)
-	if err != nil {
+	if err := nodeStageValidation(volumeID, stagingTarget, volumeCapability); err != nil {
 		return nil, err
 	}
 
@@ -85,19 +84,18 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 		}
 	}
 
-	// Try expanding the volume if it's created from a snapshot or another volume (see #1539)
-	if vol.SourceVolID != "" || vol.SnapshotID != "" {
-		r := mountutils.NewResizeFs(mount.Mounter().Exec)
-		needResize, err := r.NeedResize(devicePath, stagingTarget)
-		if err != nil {
-			return nil, status.Errorf(codes.Unknown, "Could not determine if volume %v need to be resized: %v",
-				volumeID, err)
-		}
-		if needResize {
-			log.Infof("NodeStageVolume: Resizing volume %v created from a snapshot/volume", volumeID)
-			if _, err := r.Resize(devicePath, stagingTarget); err != nil {
-				return nil, status.Errorf(codes.Unknown, "Could not resize volume %v:  %v", volumeID, err)
-			}
+	// Grow the filesystem if the disk is larger (created from a snapshot or another volume, see #1539,
+	// or expanded while unstaged). Always checked: cheap, and it needs no cloud API.
+	r := mountutils.NewResizeFs(mount.Mounter().Exec)
+	needResize, err := r.NeedResize(devicePath, stagingTarget)
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, "Could not determine if volume %v need to be resized: %v",
+			volumeID, err)
+	}
+	if needResize {
+		log.Infof("NodeStageVolume: Resizing volume %v", volumeID)
+		if _, err := r.Resize(devicePath, stagingTarget); err != nil {
+			return nil, status.Errorf(codes.Unknown, "Could not resize volume %v:  %v", volumeID, err)
 		}
 	}
 
@@ -106,6 +104,15 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 }
 
 func getDevicePath(api evsAPI, volumeID string, mount mounts.IMount) (string, error) {
+	if api == nil {
+		// keyless: a virtio disk shows up as /dev/disk/by-id/virtio-<id[:20]> (SCSI passthrough needs
+		// the WWN from the API and is not supported without credentials)
+		devicePath, err := mount.GetDevicePath(volumeID)
+		if err != nil || devicePath == "" {
+			return "", fmt.Errorf("can not get the \"devicePath\" by ID: %s: %v", volumeID, err)
+		}
+		return devicePath, nil
+	}
 	volume, err := api.GetVolume(volumeID)
 	if err != nil {
 		return "", err
@@ -118,7 +125,7 @@ func getDevicePath(api evsAPI, volumeID string, mount mounts.IMount) (string, er
 	}
 
 	devicePath := getDevicePathByID(mount, volumeID)
-	if devicePath == "" {
+	if devicePath == "" && volume.WWN != "" {
 		devicePath = getDevicePathByID(mount, volume.WWN)
 	}
 
@@ -138,23 +145,17 @@ func getDevicePathByID(mount mounts.IMount, id string) string {
 	return devicePath
 }
 
-func nodeStageValidation(api evsAPI, volumeID, target string, vc *csi.VolumeCapability) (
-	*cloudvolumes.Volume, error) {
+func nodeStageValidation(volumeID, target string, vc *csi.VolumeCapability) error {
 	if len(volumeID) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Validation failed, VolumeID cannot be empty")
+		return status.Error(codes.InvalidArgument, "Validation failed, VolumeID cannot be empty")
 	}
 	if len(target) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Validation failed, StagingTargetPath cannot be empty")
+		return status.Error(codes.InvalidArgument, "Validation failed, StagingTargetPath cannot be empty")
 	}
 	if vc == nil {
-		return nil, status.Error(codes.InvalidArgument, "Validation failed, VolumeCapability cannot be empty")
+		return status.Error(codes.InvalidArgument, "Validation failed, VolumeCapability cannot be empty")
 	}
-
-	vol, err := api.GetVolume(volumeID)
-	if err != nil {
-		return nil, err
-	}
-	return vol, nil
+	return nil
 }
 
 func (ns *nodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
@@ -162,7 +163,7 @@ func (ns *nodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
-	if err := unstagetValidation(ns.Driver.api, volumeID, stagingTargetPath); err != nil {
+	if err := unstagetValidation(volumeID, stagingTargetPath); err != nil {
 		return nil, err
 	}
 
@@ -176,17 +177,12 @@ func (ns *nodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func unstagetValidation(api evsAPI, volumeID, target string) error {
+func unstagetValidation(volumeID, target string) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, VolumeID cannot be empty")
 	}
 	if len(target) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, StagingTargetPath cannot be empty")
-	}
-
-	_, err := api.GetVolume(volumeID)
-	if err != nil {
-		return err
 	}
 	return nil
 }
@@ -199,12 +195,16 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	targetPath := req.GetTargetPath()
 	volumeCapability := req.GetVolumeCapability()
 
-	if err := nodePublishValidation(ns.Driver.api, volumeID, source, targetPath, volumeCapability); err != nil {
+	if err := nodePublishValidation(volumeID, source, targetPath, volumeCapability); err != nil {
 		return nil, err
 	}
 
 	ephemeralVolume := req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "true"
 	if ephemeralVolume {
+		if ns.Driver.api == nil {
+			return nil, status.Error(codes.InvalidArgument,
+				"Inline ephemeral volumes need cloud credentials; this node plugin runs keyless")
+		}
 		return nodePublishEphemeral(req, ns)
 	}
 
@@ -246,7 +246,7 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func nodePublishValidation(api evsAPI, volumeID, sourcePath, targetPath string, vc *csi.VolumeCapability) error {
+func nodePublishValidation(volumeID, sourcePath, targetPath string, vc *csi.VolumeCapability) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, volumeID cannot be empty")
 	}
@@ -258,11 +258,6 @@ func nodePublishValidation(api evsAPI, volumeID, sourcePath, targetPath string, 
 	}
 	if len(sourcePath) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, stagingTargetPath cannot be empty")
-	}
-
-	_, err := api.GetVolume(volumeID)
-	if err != nil {
-		return err
 	}
 	return nil
 }
@@ -279,6 +274,14 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, VolumeID cannot be empty")
+	}
+	if api == nil {
+		// keyless: no inline ephemeral volumes exist here, so there is nothing to look up
+		if err := ns.Mount.UnmountPath(targetPath); err != nil {
+			return nil, status.Errorf(codes.Unknown,
+				"Error unpublishing volume on node, TargetPath: %s, error: %s", targetPath, err)
+		}
+		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 
 	ephemeralVolume := false
@@ -407,7 +410,7 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
 
-	if err := nodeExpendValidation(ns.Driver.api, volumeID, volumePath); err != nil {
+	if err := nodeExpendValidation(volumeID, volumePath); err != nil {
 		return nil, err
 	}
 
@@ -428,19 +431,13 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	return &csi.NodeExpandVolumeResponse{}, nil
 }
 
-func nodeExpendValidation(api evsAPI, volumeID, volumePath string) error {
+func nodeExpendValidation(volumeID, volumePath string) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, VolumeID not provided")
 	}
 	if len(volumePath) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, VolumePath not provided")
 	}
-
-	_, err := api.GetVolume(volumeID)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 

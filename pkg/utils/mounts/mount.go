@@ -146,15 +146,23 @@ func (m *Mount) GetDevicePath(volumeID string) (string, error) {
 
 // GetDevicePathBySerialID returns the path of an attached block storage volume, specified by its id.
 func (m *Mount) getDevicePathBySerialID(volumeID string) string {
+	if volumeID == "" {
+		return ""
+	}
+	// KVM truncates the disk serial to 20 characters; a shorter ID (or an empty WWN) must not panic
+	serial := volumeID
+	if len(serial) > 20 {
+		serial = serial[:20]
+	}
 	// Build a list of candidate device paths.
 	// Certain Nova drivers will set the disk serial ID, including the Cinder volume id.
 	candidateDeviceNodes := []string{
 		// KVM
-		fmt.Sprintf("virtio-%s", volumeID[:20]),
+		fmt.Sprintf("virtio-%s", serial),
 		// KVM #852
 		fmt.Sprintf("virtio-%s", volumeID),
 		// KVM virtio-scsi
-		fmt.Sprintf("scsi-0QEMU_QEMU_HARDDISK_%s", volumeID[:20]),
+		fmt.Sprintf("scsi-0QEMU_QEMU_HARDDISK_%s", serial),
 		// KVM virtio-scsi #852
 		fmt.Sprintf("scsi-0QEMU_QEMU_HARDDISK_%s", volumeID),
 		// KVM scsi

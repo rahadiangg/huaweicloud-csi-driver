@@ -55,9 +55,6 @@ func NewDriver(cc *config.CloudCredentials, endpoint, cluster, nodeID string) *E
 	d.nodeID = nodeID
 	d.cloudCredentials = cc
 	d.poll = common.WaitForCompleted
-	if cc != nil {
-		d.api = cloudAPI{cc: cc}
-	}
 
 	log.Infof("Driver: %s, Version: %s, CSI Spec version: %s", d.name, version.Version, specVersion)
 
@@ -84,8 +81,12 @@ func NewDriver(cc *config.CloudCredentials, endpoint, cluster, nodeID string) *E
 		})
 
 	d.ids = &identityServer{Driver: d}
-	d.cs = &ControllerServer{Driver: d}
 	d.ns = &nodeServer{Driver: d}
+	// Without a cloud config this is a keyless node plugin: no controller, no cloud API.
+	if cc != nil {
+		d.api = cloudAPI{cc: cc}
+		d.cs = &ControllerServer{Driver: d}
+	}
 
 	return d
 }
@@ -160,6 +161,15 @@ func (d *EvsDriver) SetupDriver(mount mounts.IMount, metadata metadatas.IMetadat
 
 func (d *EvsDriver) Run() {
 	s := NewNonBlockingGRPCServer()
-	s.Start(d.endpoint, d.ids, d.cs, d.ns)
+	s.Start(d.endpoint, d.ids, d.controller(), d.ns)
 	s.Wait()
+}
+
+// controller is a nil interface without credentials, so the controller service is not registered
+// and gRPC answers Unimplemented (a typed nil *ControllerServer would register and panic).
+func (d *EvsDriver) controller() csi.ControllerServer {
+	if d.cs == nil {
+		return nil
+	}
+	return d.cs
 }

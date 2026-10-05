@@ -83,8 +83,8 @@ func main() {
 	cmd.PersistentFlags().StringVar(&endpoint, "endpoint", "", "CSI endpoint")
 	cmd.MarkPersistentFlagRequired("endpoint")
 
-	cmd.PersistentFlags().StringVar(&cloudConfig, "cloud-config", "", "CSI driver cloud config. This option can be given multiple times")
-	cmd.MarkPersistentFlagRequired("cloud-config")
+	cmd.PersistentFlags().StringVar(&cloudConfig, "cloud-config", "",
+		"CSI driver cloud config. Without it the plugin runs keyless: node service only, no cloud API")
 
 	cmd.PersistentFlags().StringVar(&cluster, "cluster", "", "The identifier of the cluster that the plugin is running in.")
 
@@ -100,9 +100,14 @@ func main() {
 }
 
 func handle() {
-	cloud, err := config.LoadConfig(cloudConfig)
-	if err != nil {
-		klog.Fatalf("Failed to load cloud config: %v", err)
+	var cloud *config.CloudCredentials
+	if cloudConfig != "" {
+		var err error
+		if cloud, err = config.LoadConfig(cloudConfig); err != nil {
+			klog.Fatalf("Failed to load cloud config: %v", err)
+		}
+	} else {
+		klog.Infof("No cloud config: running keyless, node service only")
 	}
 
 	d := evs.NewDriver(cloud, endpoint, cluster, nodeID)
