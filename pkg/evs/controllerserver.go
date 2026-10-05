@@ -101,13 +101,13 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if sizeGB < 10 {
 		volumeID, err = services.CreateCinderCompleted(credentials, createOpts)
 	} else {
-		volumeID, err = services.CreateVolumeCompleted(credentials, createOpts)
+		volumeID, err = cs.Driver.api.CreateVolume(createOpts)
 	}
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	volume, err := services.GetVolume(credentials, volumeID)
+	volume, err := cs.Driver.api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +201,7 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
 
-	credentials := cs.Driver.cloudCredentials
-	if err := services.DeleteVolume(credentials, volumeID); err != nil {
+	if err := cs.Driver.api.DeleteVolume(volumeID); err != nil {
 		if common.IsNotFound(err) {
 			log.Infof("Volume %s does not exist, skip deleting", volumeID)
 			return &csi.DeleteVolumeResponse{}, nil
@@ -223,8 +222,7 @@ func (cs *ControllerServer) ControllerGetVolume(_ context.Context, req *csi.Cont
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
 
-	credentials := cs.Driver.cloudCredentials
-	volume, err := services.GetVolume(credentials, volumeID)
+	volume, err := cs.Driver.api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -260,13 +258,13 @@ const (
 func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.ControllerPublishVolumeRequest) (
 	*csi.ControllerPublishVolumeResponse, error) {
 	log.Infof("ControllerPublishVolume: called with args %+v", protosanitizer.StripSecrets(*req))
-	credentials := cs.Driver.cloudCredentials
+	api := cs.Driver.api
 	instanceID := req.GetNodeId()
 	volumeID := req.GetVolumeId()
-	if err := publishValidation(credentials, volumeID, instanceID, req.GetVolumeCapability()); err != nil {
+	if err := publishValidation(api, volumeID, instanceID, req.GetVolumeCapability()); err != nil {
 		return nil, err
 	}
-	volume, err := services.GetVolume(credentials, volumeID)
+	volume, err := api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -275,12 +273,12 @@ func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.
 	log.Infof("ControllerPublishVolume: attachmentStatus is %s", attachmentStatus)
 	switch attachmentStatus {
 	case VolumeNotAttached:
-		if err := services.AttachVolumeCompleted(credentials, instanceID, volumeID); err != nil {
+		if err := api.AttachVolume(instanceID, volumeID); err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to publish volume %s to ECS %s with error %v",
 				volumeID, instanceID, err)
 		}
 	case VolumeAttachingCurrentServer:
-		if err := services.WaitForVolumeAttaching(credentials, volumeID); err != nil {
+		if err := api.WaitForVolumeAttaching(volumeID); err != nil {
 			return nil, status.Errorf(codes.Internal,
 				"Failed to wait for volume: %s attaching ECS: %s with error %v", volumeID, instanceID, err)
 		}
@@ -297,7 +295,7 @@ func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.
 	}
 
 	log.Infof("Successfully published volume %s to EVS %s, obtaining device path", volumeID, instanceID)
-	if volume, err = services.GetVolume(credentials, volumeID); err != nil {
+	if volume, err = api.GetVolume(volumeID); err != nil {
 		return nil, err
 	}
 	return buildPublishVolumeResponse(volume, instanceID), nil
@@ -347,7 +345,7 @@ func volumeAttachmentStatus(volume *cloudvolumes.Volume, instanceID string) Volu
 	return VolumeAttachError
 }
 
-func publishValidation(cc *config.CloudCredentials, volumeID, instanceID string, capability *csi.VolumeCapability) error {
+func publishValidation(api evsAPI, volumeID, instanceID string, capability *csi.VolumeCapability) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
@@ -358,7 +356,7 @@ func publishValidation(cc *config.CloudCredentials, volumeID, instanceID string,
 		return status.Error(codes.InvalidArgument, "Validation failed, volume capability cannot be empty")
 	}
 
-	if _, err := services.GetServer(cc, instanceID); err != nil {
+	if err := api.GetServer(instanceID); err != nil {
 		return err
 	}
 
@@ -369,11 +367,10 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, req *cs
 	*csi.ControllerUnpublishVolumeResponse, error) {
 	log.Infof("ControllerUnpublishVolume: called with args %v", protosanitizer.StripSecrets(*req))
 
-	credentials := cs.Driver.cloudCredentials
 	instanceID := req.GetNodeId()
 	volumeID := req.GetVolumeId()
 
-	volume, err := unpublishValidation(credentials, volumeID, instanceID)
+	volume, err := unpublishValidation(cs.Driver.api, volumeID, instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -384,7 +381,7 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, req *cs
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
-	err = services.DetachVolumeCompleted(credentials, instanceID, volumeID)
+	err = cs.Driver.api.DetachVolume(instanceID, volumeID)
 	if err != nil {
 		if strings.Contains(err.Error(), "Ecs.0111") {
 			log.Warningf("Warning, the volume %s is not in the server %s attach volume list, skip unpublishing",
@@ -399,7 +396,7 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, req *cs
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
-func unpublishValidation(cc *config.CloudCredentials, volumeID, instanceID string) (*cloudvolumes.Volume, error) {
+func unpublishValidation(api evsAPI, volumeID, instanceID string) (*cloudvolumes.Volume, error) {
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
@@ -407,12 +404,12 @@ func unpublishValidation(cc *config.CloudCredentials, volumeID, instanceID strin
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, ECS instance ID cannot be empty")
 	}
 
-	volume, err := services.GetVolume(cc, volumeID)
+	volume, err := api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err = services.GetServer(cc, instanceID); err != nil {
+	if err = api.GetServer(instanceID); err != nil {
 		return nil, err
 	}
 
@@ -432,7 +429,7 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, req *csi.ListVolumesR
 		Marker: req.StartingToken,
 		Limit:  int(req.MaxEntries),
 	}
-	volumes, err := services.ListVolumes(cs.Driver.cloudCredentials, opts)
+	volumes, err := cs.Driver.api.ListVolumes(opts)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -489,7 +486,7 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 		return response, nil
 	}
 
-	if _, err := services.GetVolume(credentials, volumeID); err != nil {
+	if _, err := cs.Driver.api.GetVolume(volumeID); err != nil {
 		return nil, err
 	}
 	snapshot, err := services.CreateSnapshotCompleted(credentials, name, volumeID)
@@ -637,7 +634,7 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *c
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
-	if _, err := services.GetVolume(cs.Driver.cloudCredentials, volumeID); err != nil {
+	if _, err := cs.Driver.api.GetVolume(volumeID); err != nil {
 		return nil, err
 	}
 
@@ -666,8 +663,6 @@ func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityReq
 func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.ControllerExpandVolumeRequest) (
 	*csi.ControllerExpandVolumeResponse, error) {
 	log.Infof("ControllerExpandVolume: called with args %v", protosanitizer.StripSecrets(*req))
-	cc := cs.Driver.cloudCredentials
-
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
@@ -685,7 +680,7 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 			"Validation failed, after round-up volume size %v exceeds the max size %v", sizeBytes, maxSizeBytes)
 	}
 
-	volume, err := services.GetVolume(cc, volumeID)
+	volume, err := cs.Driver.api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -697,7 +692,7 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		}, nil
 	}
 
-	err = services.ExpandVolume(cc, volumeID, sizeGB)
+	err = cs.Driver.api.ExpandVolume(volumeID, sizeGB)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"Error resizing volume %v to size %v, error: %s", volumeID, sizeGB, err)

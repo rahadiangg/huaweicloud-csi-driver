@@ -19,8 +19,6 @@ import (
 	utilpath "k8s.io/utils/path"
 
 	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/common"
-	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/config"
-	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/evs/services"
 	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/utils/metadatas"
 	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/utils/mounts"
 )
@@ -39,12 +37,12 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	*csi.NodeStageVolumeResponse, error) {
 	log.Infof("NodeStageVolume: called with args %v", protosanitizer.StripSecrets(*req))
 
-	cc := ns.Driver.cloudCredentials
+	api := ns.Driver.api
 	stagingTarget := req.GetStagingTargetPath()
 	volumeCapability := req.GetVolumeCapability()
 	volumeID := req.GetVolumeId()
 
-	vol, err := nodeStageValidation(cc, volumeID, stagingTarget, volumeCapability)
+	vol, err := nodeStageValidation(api, volumeID, stagingTarget, volumeCapability)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +50,7 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	// Verify whether mounted
 	mount := ns.Mount
 	// Do not trust the path provided by EVS, get the real path on node
-	devicePath, err := getDevicePath(cc, volumeID, mount)
+	devicePath, err := getDevicePath(api, volumeID, mount)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Unable to find devicePath for volume: %v", err)
 	}
@@ -107,8 +105,8 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-func getDevicePath(cc *config.CloudCredentials, volumeID string, mount mounts.IMount) (string, error) {
-	volume, err := services.GetVolume(cc, volumeID)
+func getDevicePath(api evsAPI, volumeID string, mount mounts.IMount) (string, error) {
+	volume, err := api.GetVolume(volumeID)
 	if err != nil {
 		return "", err
 	}
@@ -140,7 +138,7 @@ func getDevicePathByID(mount mounts.IMount, id string) string {
 	return devicePath
 }
 
-func nodeStageValidation(cc *config.CloudCredentials, volumeID, target string, vc *csi.VolumeCapability) (
+func nodeStageValidation(api evsAPI, volumeID, target string, vc *csi.VolumeCapability) (
 	*cloudvolumes.Volume, error) {
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, VolumeID cannot be empty")
@@ -152,7 +150,7 @@ func nodeStageValidation(cc *config.CloudCredentials, volumeID, target string, v
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, VolumeCapability cannot be empty")
 	}
 
-	vol, err := services.GetVolume(cc, volumeID)
+	vol, err := api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +162,7 @@ func (ns *nodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
-	if err := unstagetValidation(ns.Driver.cloudCredentials, volumeID, stagingTargetPath); err != nil {
+	if err := unstagetValidation(ns.Driver.api, volumeID, stagingTargetPath); err != nil {
 		return nil, err
 	}
 
@@ -178,7 +176,7 @@ func (ns *nodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func unstagetValidation(cc *config.CloudCredentials, volumeID, target string) error {
+func unstagetValidation(api evsAPI, volumeID, target string) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, VolumeID cannot be empty")
 	}
@@ -186,7 +184,7 @@ func unstagetValidation(cc *config.CloudCredentials, volumeID, target string) er
 		return status.Error(codes.InvalidArgument, "Validation failed, StagingTargetPath cannot be empty")
 	}
 
-	_, err := services.GetVolume(cc, volumeID)
+	_, err := api.GetVolume(volumeID)
 	if err != nil {
 		return err
 	}
@@ -196,13 +194,12 @@ func unstagetValidation(cc *config.CloudCredentials, volumeID, target string) er
 func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	log.Infof("NodePublishVolume: called with args %v", protosanitizer.StripSecrets(*req))
 
-	cc := ns.Driver.cloudCredentials
 	volumeID := req.GetVolumeId()
 	source := req.GetStagingTargetPath()
 	targetPath := req.GetTargetPath()
 	volumeCapability := req.GetVolumeCapability()
 
-	if err := nodePublishValidation(cc, volumeID, source, targetPath, volumeCapability); err != nil {
+	if err := nodePublishValidation(ns.Driver.api, volumeID, source, targetPath, volumeCapability); err != nil {
 		return nil, err
 	}
 
@@ -249,7 +246,7 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func nodePublishValidation(cc *config.CloudCredentials, volumeID, sourcePath, targetPath string, vc *csi.VolumeCapability) error {
+func nodePublishValidation(api evsAPI, volumeID, sourcePath, targetPath string, vc *csi.VolumeCapability) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, volumeID cannot be empty")
 	}
@@ -263,7 +260,7 @@ func nodePublishValidation(cc *config.CloudCredentials, volumeID, sourcePath, ta
 		return status.Error(codes.InvalidArgument, "Validation failed, stagingTargetPath cannot be empty")
 	}
 
-	_, err := services.GetVolume(cc, volumeID)
+	_, err := api.GetVolume(volumeID)
 	if err != nil {
 		return err
 	}
@@ -274,7 +271,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	*csi.NodeUnpublishVolumeResponse, error) {
 	log.Infof("NodeUnpublishVolume: called with args %v", protosanitizer.StripSecrets(*req))
 
-	cc := ns.Driver.cloudCredentials
+	api := ns.Driver.api
 	volumeID := req.GetVolumeId()
 	targetPath := req.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -285,14 +282,14 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 
 	ephemeralVolume := false
-	vol, err := services.GetVolume(cc, volumeID)
+	vol, err := api.GetVolume(volumeID)
 	if err != nil {
 		if !common.IsNotFound(err) {
 			return nil, status.Errorf(codes.Internal, "Error querying volume details: %s", err)
 		}
 		// if not found by id, try to search by name
 		volName := fmt.Sprintf("ephemeral-%s", volumeID)
-		vols, err := services.ListVolumes(cc, cloudvolumes.ListOpts{
+		vols, err := api.ListVolumes(cloudvolumes.ListOpts{
 			Name: volName,
 		})
 		//if volume not found then GetVolumesByName returns empty list
@@ -410,7 +407,7 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
 
-	if err := nodeExpendValidation(ns.Driver.cloudCredentials, volumeID, volumePath); err != nil {
+	if err := nodeExpendValidation(ns.Driver.api, volumeID, volumePath); err != nil {
 		return nil, err
 	}
 
@@ -431,7 +428,7 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	return &csi.NodeExpandVolumeResponse{}, nil
 }
 
-func nodeExpendValidation(cc *config.CloudCredentials, volumeID, volumePath string) error {
+func nodeExpendValidation(api evsAPI, volumeID, volumePath string) error {
 	if len(volumeID) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, VolumeID not provided")
 	}
@@ -439,7 +436,7 @@ func nodeExpendValidation(cc *config.CloudCredentials, volumeID, volumePath stri
 		return status.Error(codes.InvalidArgument, "Validation failed, VolumePath not provided")
 	}
 
-	_, err := services.GetVolume(cc, volumeID)
+	_, err := api.GetVolume(volumeID)
 	if err != nil {
 		return err
 	}
@@ -462,7 +459,7 @@ func collectMountOptions(fsType string, mntFlags []string) []string {
 func nodeUnpublishEphemeral(ns *nodeServer, vol *cloudvolumes.Volume) (*csi.NodeUnpublishVolumeResponse, error) {
 	log.Infof("nodeUnpublishEphemeral: called with args %v", protosanitizer.StripSecrets(*vol))
 
-	cc := ns.Driver.cloudCredentials
+	api := ns.Driver.api
 	volumeID := vol.ID
 	instanceID := ""
 
@@ -472,12 +469,12 @@ func nodeUnpublishEphemeral(ns *nodeServer, vol *cloudvolumes.Volume) (*csi.Node
 		return nil, status.Error(codes.FailedPrecondition, "Error, volume attachment not found in request")
 	}
 
-	err := services.DetachVolumeCompleted(cc, instanceID, volumeID)
+	err := api.DetachVolume(instanceID, volumeID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Error unpublishing ephemeral volume on node: %s", err)
 	}
 
-	err = services.DeleteVolume(cc, volumeID)
+	err = api.DeleteVolume(volumeID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Error deleting ephemeral volume: %s", err)
 	}
@@ -488,7 +485,7 @@ func nodeUnpublishEphemeral(ns *nodeServer, vol *cloudvolumes.Volume) (*csi.Node
 func nodePublishEphemeral(req *csi.NodePublishVolumeRequest, ns *nodeServer) (*csi.NodePublishVolumeResponse, error) {
 	log.Infof("nodePublishEphemeral: called with args %v", protosanitizer.StripSecrets(*req))
 
-	cc := ns.Driver.cloudCredentials
+	api := ns.Driver.api
 	size := 10 // default size is 1GB
 	var err error
 
@@ -515,7 +512,7 @@ func nodePublishEphemeral(req *csi.NodePublishVolumeRequest, ns *nodeServer) (*c
 	metadata[CreateForVolumeIDKey] = "true"
 	metadata[DssIDKey] = req.VolumeContext[DssIDKey]
 
-	volumeID, err = services.CreateVolumeCompleted(cc, &cloudvolumes.CreateOpts{
+	volumeID, err = api.CreateVolume(&cloudvolumes.CreateOpts{
 		Volume: cloudvolumes.VolumeOpts{
 			Name:             volumeName,
 			Size:             size,
@@ -537,14 +534,14 @@ func nodePublishEphemeral(req *csi.NodePublishVolumeRequest, ns *nodeServer) (*c
 		return nil, status.Errorf(codes.Internal, "Failed to get instance ID with error %s", err)
 	}
 
-	err = services.AttachVolumeCompleted(cc, instanceID, volumeID)
+	err = api.AttachVolume(instanceID, volumeID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to attach volume %s to ECS %s with error : %v",
 			volumeID, instanceID, err)
 	}
 
 	m := ns.Mount
-	devicePath, err := getDevicePath(ns.Driver.cloudCredentials, volumeID, m)
+	devicePath, err := getDevicePath(api, volumeID, m)
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("Unable to find devicePath for volume: %v", err))
 	}
@@ -590,7 +587,7 @@ func nodePublishVolumeForBlock(req *csi.NodePublishVolumeRequest, ns *nodeServer
 	m := ns.Mount
 
 	// Do not trust the path provided by cinder, get the real path on node
-	source, err := getDevicePath(ns.Driver.cloudCredentials, volumeID, m)
+	source, err := getDevicePath(ns.Driver.api, volumeID, m)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Error query devicePath for volume %s: %v", volumeID, err)
 	}

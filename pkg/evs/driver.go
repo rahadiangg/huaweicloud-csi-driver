@@ -32,6 +32,7 @@ type EvsDriver struct { //nolint: revive
 	cluster  string
 
 	cloudCredentials *config.CloudCredentials
+	api              evsAPI
 
 	ids *identityServer
 	cs  *ControllerServer
@@ -50,6 +51,9 @@ func NewDriver(cc *config.CloudCredentials, endpoint, cluster, nodeID string) *E
 	d.cluster = cluster
 	d.nodeID = nodeID
 	d.cloudCredentials = cc
+	if cc != nil {
+		d.api = cloudAPI{cc: cc}
+	}
 
 	log.Infof("Driver: %s, Version: %s, CSI Spec version: %s", d.name, version.Version, specVersion)
 
