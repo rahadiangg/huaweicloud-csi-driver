@@ -327,3 +327,39 @@ func TestDeleteVolume(t *testing.T) {
 		})
 	}
 }
+
+func TestControllerExpand(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		size            int
+		required, limit int64
+		want            codes.Code
+		wantBytes       int64
+		expands         int
+	}{
+		{name: "grows, returns the rounded size", size: 10, required: 20*gi + 1, wantBytes: 21 * gi, expands: 1},
+		{name: "already larger: no API call", size: 30, required: 20 * gi, wantBytes: 30 * gi},
+		{name: "above 32TiB", size: 10, required: 33000 * gi, want: codes.OutOfRange},
+		{name: "limit below the rounded size", size: 10, required: 20*gi + 1, limit: 20*gi + 2, want: codes.OutOfRange},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI()
+			id := f.add(cloudvolumes.Volume{Status: "in-use", Size: tc.size}, "")
+			resp, err := newFakeDriver(f).cs.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+				VolumeId: id, CapacityRange: &csi.CapacityRange{RequiredBytes: tc.required, LimitBytes: tc.limit}})
+			wantCode(t, err, tc.want)
+			if got := f.called("ExpandVolume"); got != tc.expands {
+				t.Fatalf("expand calls = %d, want %d", got, tc.expands)
+			}
+			if err == nil && (resp.CapacityBytes != tc.wantBytes || !resp.NodeExpansionRequired) {
+				t.Fatalf("resp = %+v, want %d bytes", resp, tc.wantBytes)
+			}
+		})
+	}
+}
+
+func TestControllerExpand_Gone(t *testing.T) {
+	_, err := newFakeDriver(newFakeAPI()).cs.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId: "00000000-0000-4000-8000-00000000dead", CapacityRange: &csi.CapacityRange{RequiredBytes: 20 * gi}})
+	wantCode(t, err, codes.NotFound)
+}

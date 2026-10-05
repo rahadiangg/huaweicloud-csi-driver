@@ -842,12 +842,9 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, capacity range cannot be empty")
 	}
 
-	sizeBytes := req.GetCapacityRange().GetRequiredBytes()
-	sizeGB := int(utils.RoundUpSize(sizeBytes, common.GbByteSize))
-	maxSizeBytes := capRange.GetLimitBytes()
-	if maxSizeBytes > 0 && maxSizeBytes < sizeBytes {
-		return nil, status.Errorf(codes.OutOfRange,
-			"Validation failed, after round-up volume size %v exceeds the max size %v", sizeBytes, maxSizeBytes)
+	sizeGB, err := requestedSizeGB(capRange)
+	if err != nil {
+		return nil, err
 	}
 
 	volume, err := cs.Driver.api.GetVolume(volumeID)
@@ -862,8 +859,7 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		}, nil
 	}
 
-	err = cs.Driver.api.ExpandVolume(volumeID, sizeGB)
-	if err != nil {
+	if err := cs.Driver.api.ExpandVolume(volumeID, sizeGB); err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"Error resizing volume %v to size %v, error: %s", volumeID, sizeGB, err)
 	}
@@ -871,7 +867,7 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 	log.Infof("Successfully resized volume %v to size %v", volumeID, sizeGB)
 
 	return &csi.ControllerExpandVolumeResponse{
-		CapacityBytes:         sizeBytes,
+		CapacityBytes:         int64(sizeGB) * common.GbByteSize,
 		NodeExpansionRequired: true,
 	}, nil
 }
