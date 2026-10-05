@@ -64,6 +64,11 @@ func setDefaultConfig(cc *CloudCredentials) {
 		cc.Global.Cloud = "myhuaweicloud.com"
 	}
 	if cc.Global.AuthURL == "" {
+		// The regional IAM endpoint: reachable over the cloud's internal network from nodes with no
+		// internet (the global one is not), and the only IAM call is the startup credential check.
 		cc.Global.AuthURL = fmt.Sprintf("https://iam.%s:443/v3/", cc.Global.Cloud)
+		if cc.Global.Region != "" {
+			cc.Global.AuthURL = fmt.Sprintf("https://iam.%s.%s:443/v3/", cc.Global.Region, cc.Global.Cloud)
+		}
 	}
 }
