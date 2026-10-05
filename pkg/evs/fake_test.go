@@ -9,6 +9,7 @@ import (
 	"github.com/chnsz/golangsdk/openstack/evs/v2/cloudvolumes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // fakeAPI is an in-memory EVS/ECS: jobs complete synchronously.
@@ -188,6 +189,18 @@ func (f *fakeAPI) called(name string) int {
 func newFakeDriver(f *fakeAPI) *EvsDriver {
 	d := NewDriver(nil, "", "", "")
 	d.api = f
+	d.poll = fastPoll
 	d.cs = &ControllerServer{Driver: d}
 	return d
+}
+
+// fastPoll: the WaitForCompleted contract (condition first, timeout after a few tries) with no sleep.
+func fastPoll(condition wait.ConditionFunc) error {
+	for i := 0; i < 5; i++ {
+		ok, err := condition()
+		if err != nil || ok {
+			return err
+		}
+	}
+	return wait.ErrWaitTimeout
 }

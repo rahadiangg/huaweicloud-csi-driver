@@ -19,6 +19,7 @@ const (
 	EvsAvailableStatus = "available"
 	EvsAttachingStatus = "attaching"
 	EvsInUseStatus     = "in-use"
+	EvsDetachingStatus = "detaching"
 )
 
 func CreateVolumeCompleted(c *config.CloudCredentials, otps *cloudvolumes.CreateOpts) (string, error) {

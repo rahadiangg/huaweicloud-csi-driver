@@ -6,8 +6,10 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/wait"
 	log "k8s.io/klog/v2"
 
+	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/common"
 	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/config"
 	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/utils/metadatas"
 	"github.com/huaweicloud/huaweicloud-csi-driver/pkg/utils/mounts"
@@ -33,6 +35,7 @@ type EvsDriver struct { //nolint: revive
 
 	cloudCredentials *config.CloudCredentials
 	api              evsAPI
+	poll             func(wait.ConditionFunc) error // waits on EVS state; fast in tests
 
 	ids *identityServer
 	cs  *ControllerServer
@@ -51,6 +54,7 @@ func NewDriver(cc *config.CloudCredentials, endpoint, cluster, nodeID string) *E
 	d.cluster = cluster
 	d.nodeID = nodeID
 	d.cloudCredentials = cc
+	d.poll = common.WaitForCompleted
 	if cc != nil {
 		d.api = cloudAPI{cc: cc}
 	}

@@ -3,7 +3,6 @@ package evs
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/chnsz/golangsdk/openstack/evs/v2/cloudvolumes"
 	"github.com/chnsz/golangsdk/openstack/evs/v2/snapshots"
@@ -369,34 +368,6 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, req *cs
 
 	instanceID := req.GetNodeId()
 	volumeID := req.GetVolumeId()
-
-	volume, err := unpublishValidation(cs.Driver.api, volumeID, instanceID)
-	if err != nil {
-		return nil, err
-	}
-
-	if volume.Status == services.EvsAvailableStatus || len(volume.Attachments) == 0 {
-		log.Warningf("Warning, the volume %s is not in the server %s attach volume list, skip unpublishing",
-			volumeID, instanceID)
-		return &csi.ControllerUnpublishVolumeResponse{}, nil
-	}
-
-	err = cs.Driver.api.DetachVolume(instanceID, volumeID)
-	if err != nil {
-		if strings.Contains(err.Error(), "Ecs.0111") {
-			log.Warningf("Warning, the volume %s is not in the server %s attach volume list, skip unpublishing",
-				volumeID, instanceID)
-			return &csi.ControllerUnpublishVolumeResponse{}, nil
-		}
-		return nil, status.Errorf(codes.Internal, "Error unpublishing volume %s from server %s, error: %v",
-			volumeID, instanceID, err)
-	}
-
-	log.Infof("Successfully unpublished, volume ID: %s", volumeID)
-	return &csi.ControllerUnpublishVolumeResponse{}, nil
-}
-
-func unpublishValidation(api evsAPI, volumeID, instanceID string) (*cloudvolumes.Volume, error) {
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
@@ -404,16 +375,89 @@ func unpublishValidation(api evsAPI, volumeID, instanceID string) (*cloudvolumes
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, ECS instance ID cannot be empty")
 	}
 
-	volume, err := api.GetVolume(volumeID)
+	if err := cs.unpublish(volumeID, instanceID); err != nil {
+		return nil, err
+	}
+	log.Infof("Successfully unpublished, volume ID: %s", volumeID)
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+// unpublish detaches volumeID from instanceID. It succeeds once the volume no longer hangs on that
+// server, or once the server itself is gone (a deleted ECS must not strand the VolumeAttachment,
+// upstream #175) — never while the volume is attached to a server that still exists.
+func (cs *ControllerServer) unpublish(volumeID, instanceID string) error {
+	volume, err := cs.Driver.api.GetVolume(volumeID)
+	if common.IsNotFound(err) {
+		log.Infof("Volume %s does not exist, nothing to unpublish", volumeID)
+		return nil
+	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	if err = api.GetServer(instanceID); err != nil {
-		return nil, err
+	switch {
+	case volume.Status == services.EvsAttachingStatus:
+		// an attach still in flight could land after we report "detached"
+		return status.Errorf(codes.Aborted, "Volume %s is attaching, retry once it settles", volumeID)
+	case !attachedTo(volume, instanceID):
+		log.Infof("Volume %s is not attached to server %s, nothing to unpublish", volumeID, instanceID)
+		return nil
+	case volume.Status == services.EvsDetachingStatus:
+		return cs.waitDetached(volumeID, instanceID)
 	}
 
-	return volume, nil
+	if err := cs.Driver.api.DetachVolume(instanceID, volumeID); err != nil {
+		return cs.detachOutcome(volumeID, instanceID, err)
+	}
+	return nil
+}
+
+// detachOutcome decides a failed detach from the volume and the server, not from the error text.
+func (cs *ControllerServer) detachOutcome(volumeID, instanceID string, detachErr error) error {
+	volume, err := cs.Driver.api.GetVolume(volumeID)
+	if common.IsNotFound(err) || (err == nil && !attachedTo(volume, instanceID)) {
+		return nil
+	}
+	if common.IsNotFound(cs.Driver.api.GetServer(instanceID)) {
+		log.Warningf("Server %s no longer exists, volume %s is released with it", instanceID, volumeID)
+		return nil
+	}
+	return status.Errorf(codes.Internal, "Error unpublishing volume %s from server %s, error: %v",
+		volumeID, instanceID, detachErr)
+}
+
+// waitDetached waits out a detach already in progress; still attached afterwards → Aborted (retry).
+func (cs *ControllerServer) waitDetached(volumeID, instanceID string) error {
+	var volume *cloudvolumes.Volume
+	err := cs.Driver.poll(func() (bool, error) {
+		v, err := cs.Driver.api.GetVolume(volumeID)
+		if common.IsNotFound(err) {
+			volume = nil
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		volume = v
+		return !attachedTo(v, instanceID) || v.Status != services.EvsDetachingStatus, nil
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "Error waiting for volume %s to detach from server %s: %v",
+			volumeID, instanceID, err)
+	}
+	if volume != nil && attachedTo(volume, instanceID) {
+		return status.Errorf(codes.Aborted, "Volume %s is still attached to server %s, retry", volumeID, instanceID)
+	}
+	return nil
+}
+
+func attachedTo(volume *cloudvolumes.Volume, instanceID string) bool {
+	for _, a := range volume.Attachments {
+		if a.ServerID == instanceID {
+			return true
+		}
+	}
+	return false
 }
 
 func (cs *ControllerServer) ListVolumes(_ context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse,
