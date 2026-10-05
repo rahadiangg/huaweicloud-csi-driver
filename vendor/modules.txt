@@ -8,7 +8,6 @@ github.com/PuerkitoBio/urlesc
 ## explicit; go 1.14
 github.com/chnsz/golangsdk
 github.com/chnsz/golangsdk/openstack
-github.com/chnsz/golangsdk/openstack/blockstorage/v2/volumes
 github.com/chnsz/golangsdk/openstack/compute/v2/flavors
 github.com/chnsz/golangsdk/openstack/compute/v2/images
 github.com/chnsz/golangsdk/openstack/compute/v2/servers
