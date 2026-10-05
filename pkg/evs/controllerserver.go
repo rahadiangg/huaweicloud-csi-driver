@@ -564,6 +564,11 @@ func (cs *ControllerServer) detachOutcome(volumeID, instanceID string, detachErr
 	if common.IsNotFound(err) || (err == nil && !attachedTo(volume, instanceID)) {
 		return nil
 	}
+	if err == nil && volume.Status == services.EvsDetachingStatus {
+		// the detach went through but its job could not be followed (live: an
+		// empty job ID) — wait on the volume itself, not on the job
+		return cs.waitDetached(volumeID, instanceID)
+	}
 	if common.IsNotFound(cs.Driver.api.GetServer(instanceID)) {
 		log.Warningf("Server %s no longer exists, volume %s is released with it", instanceID, volumeID)
 		return nil

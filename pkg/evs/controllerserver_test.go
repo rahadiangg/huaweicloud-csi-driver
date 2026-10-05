@@ -76,6 +76,8 @@ func TestControllerUnpublish(t *testing.T) {
 			want: codes.Internal, detaches: 1, attached: true},
 		{name: "detach errors but the volume is free", vol: ptr(inUse("node-a")), servers: []string{"node-a"}, detachErr: errDetach,
 			onGet: freeAfterFirstGet(), want: codes.OK, detaches: 1},
+		{name: "detach job unreadable, volume detaching then free", vol: ptr(inUse("node-a")), servers: []string{"node-a"}, detachErr: errDetach,
+			onGet: detachingThenFree(), want: codes.OK, detaches: 1},
 		{name: "detaching here, finishes", vol: &cloudvolumes.Volume{Status: "detaching", Attachments: []cloudvolumes.Attachment{{ServerID: "node-a"}}},
 			servers: []string{"node-a"}, onGet: freeAfterFirstGet(), want: codes.OK},
 		{name: "detaching here, bounces back to in-use", vol: &cloudvolumes.Volume{Status: "detaching", Attachments: []cloudvolumes.Attachment{{ServerID: "node-a"}}},
@@ -119,6 +121,21 @@ func freeAfterFirstGet() func(v *cloudvolumes.Volume) {
 	n := 0
 	return func(v *cloudvolumes.Volume) {
 		if n++; n > 1 {
+			v.Status, v.Attachments = "available", nil
+		}
+	}
+}
+
+// detachingThenFree: in-use on the first read, detaching on the second (the
+// detach was accepted), free from the third on — what EVS showed live when
+// the detach job ID came back empty.
+func detachingThenFree() func(v *cloudvolumes.Volume) {
+	n := 0
+	return func(v *cloudvolumes.Volume) {
+		switch n++; {
+		case n == 2:
+			v.Status = "detaching"
+		case n > 2:
 			v.Status, v.Attachments = "available", nil
 		}
 	}
