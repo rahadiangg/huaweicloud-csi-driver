@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/chnsz/golangsdk"
-	cinder "github.com/chnsz/golangsdk/openstack/blockstorage/v2/volumes"
 	"github.com/chnsz/golangsdk/openstack/evs/v1/jobs"
 	"github.com/chnsz/golangsdk/openstack/evs/v2/cloudvolumes"
 	"google.golang.org/grpc/codes"
@@ -20,6 +19,9 @@ const (
 	EvsAttachingStatus = "attaching"
 	EvsInUseStatus     = "in-use"
 	EvsDetachingStatus = "detaching"
+	EvsCreatingStatus  = "creating"
+	EvsErrorStatus     = "error"
+	EvsDeletingStatus  = "deleting"
 )
 
 func CreateVolumeCompleted(c *config.CloudCredentials, otps *cloudvolumes.CreateOpts) (string, error) {
@@ -37,52 +39,6 @@ func CreateVolumeCompleted(c *config.CloudCredentials, otps *cloudvolumes.Create
 	return waitForJobFinished(c, "creation", job.JobID)
 }
 
-func CreateCinderCompleted(c *config.CloudCredentials, opts *cloudvolumes.CreateOpts) (string, error) {
-	client, err := getEvsV2Client(c)
-	if err != nil {
-		return "", err
-	}
-
-	createOpts := cinder.CreateOpts{
-		Name:             opts.Volume.Name,
-		Size:             opts.Volume.Size,
-		VolumeType:       opts.Volume.VolumeType,
-		AvailabilityZone: opts.Volume.AvailabilityZone,
-		SnapshotID:       opts.Volume.SnapshotID,
-		Metadata:         opts.Volume.Metadata,
-		IOPS:             opts.Volume.IOPS,
-		Throughput:       opts.Volume.Throughput,
-	}
-
-	cinderVol, err := cinder.Create(client, createOpts).Extract()
-	if err != nil {
-		return "", fmt.Errorf("error creating EVS volume, error: %s, createOpts: %#v", err, opts)
-	}
-
-	return cinderVol.ID, waitForCinderFinished(c, cinderVol.ID)
-}
-
-func waitForCinderFinished(c *config.CloudCredentials, cinderID string) error {
-	return common.WaitForCompleted(func() (bool, error) {
-		vol, err := GetVolume(c, cinderID)
-		if err != nil {
-			return false, status.Error(codes.Internal,
-				fmt.Sprintf("Error querying cinder detail %s : %s", cinderID, err))
-		}
-
-		if vol.Status == "available" || vol.Status == "in-use" {
-			return true, nil
-		}
-
-		if vol.Status == "error" {
-			return false, status.Error(codes.Internal,
-				fmt.Sprintf("Error waiting for the cinder to be created, id: %s, statue: error", cinderID))
-		}
-
-		return false, nil
-	})
-}
-
 func GetVolume(c *config.CloudCredentials, id string) (*cloudvolumes.Volume, error) {
 	client, err := getEvsV2Client(c)
 	if err != nil {
@@ -97,31 +53,6 @@ func GetVolume(c *config.CloudCredentials, id string) (*cloudvolumes.Volume, err
 		return nil, status.Errorf(codes.Internal, "Error querying volume details: %s", err)
 	}
 	return volume, nil
-}
-
-func CheckVolumeExists(credentials *config.CloudCredentials, name string, sizeGB int) (*cloudvolumes.Volume, error) {
-	opts := cloudvolumes.ListOpts{
-		Name: name,
-	}
-	volumes, err := ListVolumes(credentials, opts)
-	if err != nil {
-		return nil, status.Error(codes.Internal,
-			fmt.Sprintf("Failed to query the volume by name, cannot verify whether it exists: %s", err))
-	}
-
-	if len(volumes) == 1 {
-		vol := volumes[0]
-		if sizeGB != vol.Size {
-			return nil, status.Error(codes.AlreadyExists,
-				"A volume already exists with the same name but a different capacity")
-		}
-		log.Infof("Volume %s already exists in AZ %s of size %d GiB", vol.ID, vol.AvailabilityZone, vol.Size)
-		return &vol, nil
-	} else if len(volumes) > 1 {
-		return nil, status.Error(codes.AlreadyExists, "Found multiple volumes with same name")
-	}
-
-	return nil, nil
 }
 
 func ExpandVolume(c *config.CloudCredentials, id string, newSize int) error {

@@ -3,6 +3,7 @@ package evs
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/chnsz/golangsdk/openstack/evs/v2/cloudvolumes"
 	"github.com/chnsz/golangsdk/openstack/evs/v2/snapshots"
@@ -22,6 +23,8 @@ import (
 
 const (
 	defaultSizeGB = 10
+	minSizeGB     = 10    // the smallest EVS data disk: smaller requests round up
+	maxSizeGB     = 32768 // the largest EVS data disk (32 TiB)
 )
 
 type ControllerServer struct {
@@ -38,10 +41,9 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		return nil, err
 	}
 
-	// Volume Size - Default is 10 GiB
-	sizeGB := defaultSizeGB
-	if req.GetCapacityRange() != nil {
-		sizeGB = int(utils.RoundUpSize(req.GetCapacityRange().GetRequiredBytes(), common.GbByteSize))
+	sizeGB, err := requestedSizeGB(req.GetCapacityRange())
+	if err != nil {
+		return nil, err
 	}
 
 	parameters := req.GetParameters()
@@ -55,10 +57,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	}
 
 	dssID := parameters["dssId"]
+	epID := parameters["enterpriseProjectId"]
+	tags, err := parseTags(parameters["tags"])
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if there are any volumes with the same name
-	if vol, err := services.CheckVolumeExists(credentials, volName, sizeGB); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	if vol, err := cs.existingVolume(volName, epID, sizeGB); err != nil {
+		return nil, err
 	} else if vol != nil {
 		return buildCreateVolumeResponse(vol, dssID), nil
 	}
@@ -82,26 +89,23 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	metadata := cs.parseMetadata(req, snapshotID)
 	createOpts := &cloudvolumes.CreateOpts{
 		Volume: cloudvolumes.VolumeOpts{
-			Name:             volName,
-			Size:             sizeGB,
-			VolumeType:       volumeType,
-			AvailabilityZone: volumeAz,
-			SnapshotID:       snapshotID,
-			Metadata:         metadata,
-			IOPS:             iops,
-			Throughput:       throughput,
+			Name:                volName,
+			Size:                sizeGB,
+			VolumeType:          volumeType,
+			AvailabilityZone:    volumeAz,
+			SnapshotID:          snapshotID,
+			Metadata:            metadata,
+			Tags:                tags,
+			EnterpriseProjectID: epID,
+			IOPS:                iops,
+			Throughput:          throughput,
 		},
 		Scheduler: &cloudvolumes.SchedulerOpts{
 			StorageID: dssID,
 		},
 	}
 
-	volumeID := ""
-	if sizeGB < 10 {
-		volumeID, err = services.CreateCinderCompleted(credentials, createOpts)
-	} else {
-		volumeID, err = cs.Driver.api.CreateVolume(createOpts)
-	}
+	volumeID, err := cs.Driver.api.CreateVolume(createOpts)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -171,7 +175,111 @@ func createVolumeValidation(volumeName string, capabilities []*csi.VolumeCapabil
 	if len(capabilities) == 0 {
 		return status.Error(codes.InvalidArgument, "Validation failed, volume capabilities cannot be empty")
 	}
+	for _, c := range capabilities {
+		if mode := c.GetAccessMode().GetMode(); mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER {
+			return status.Errorf(codes.InvalidArgument,
+				"Validation failed, access mode %v is not supported: an EVS disk attaches to one node", mode)
+		}
+	}
 	return nil
+}
+
+// requestedSizeGB turns a capacity range into whole GiB within EVS's 10 GiB - 32 TiB.
+func requestedSizeGB(capRange *csi.CapacityRange) (int, error) {
+	sizeGB := int64(defaultSizeGB)
+	if required := capRange.GetRequiredBytes(); required > 0 {
+		sizeGB = utils.RoundUpSize(required, common.GbByteSize)
+	}
+	if sizeGB < minSizeGB {
+		sizeGB = minSizeGB
+	}
+	if sizeGB > maxSizeGB {
+		return 0, status.Errorf(codes.OutOfRange, "Validation failed, %d GiB exceeds the EVS maximum of %d GiB",
+			sizeGB, maxSizeGB)
+	}
+	if limit := capRange.GetLimitBytes(); limit > 0 && sizeGB*common.GbByteSize > limit {
+		return 0, status.Errorf(codes.OutOfRange,
+			"Validation failed, the rounded-up size %d GiB exceeds the limit of %d bytes", sizeGB, limit)
+	}
+	return int(sizeGB), nil
+}
+
+// parseTags reads the "tags" StorageClass parameter, "k=v,k=v"; EVS enforces its own limits.
+func parseTags(s string) (map[string]string, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	tags := map[string]string{}
+	for _, kv := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(kv, "=")
+		if k = strings.TrimSpace(k); !ok || k == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "Validation failed, tags must be k=v,k=v, got %q", s)
+		}
+		tags[k] = strings.TrimSpace(v)
+	}
+	return tags, nil
+}
+
+// existingVolume finds a disk made by an earlier attempt of this request: an exact name match (EVS
+// filters names fuzzily), looked up in the enterprise project the disk goes into — a key scoped to
+// that project may not see it otherwise, and a retry would create a duplicate.
+func (cs *ControllerServer) existingVolume(name, epID string, sizeGB int) (*cloudvolumes.Volume, error) {
+	vols, err := cs.Driver.api.ListVolumes(cloudvolumes.ListOpts{Name: name, EnterpriseProjectID: epID})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"Failed to query the volume by name, cannot verify whether it exists: %s", err)
+	}
+	var found []cloudvolumes.Volume
+	for _, v := range vols {
+		if v.Name == name {
+			found = append(found, v)
+		}
+	}
+	switch {
+	case len(found) == 0:
+		return nil, nil
+	case len(found) > 1:
+		return nil, status.Error(codes.AlreadyExists, "Found multiple volumes with same name")
+	case found[0].Size != sizeGB:
+		return nil, status.Error(codes.AlreadyExists, "A volume already exists with the same name but a different capacity")
+	}
+	return cs.settledVolume(&found[0])
+}
+
+// settledVolume returns an earlier attempt's disk once it is usable: still creating -> wait; failed ->
+// delete it and retry (CreateVolume runs before any PV exists, so a pvc-<uid> disk that never finished
+// creating holds no data); being deleted -> retry.
+func (cs *ControllerServer) settledVolume(vol *cloudvolumes.Volume) (*cloudvolumes.Volume, error) {
+	switch vol.Status {
+	case services.EvsCreatingStatus:
+		return cs.waitCreated(vol.ID)
+	case services.EvsErrorStatus:
+		if err := cs.Driver.api.DeleteVolume(vol.ID); err != nil && !common.IsNotFound(err) {
+			return nil, status.Errorf(codes.Internal,
+				"Failed to delete volume %s left in error by an earlier attempt: %v", vol.ID, err)
+		}
+		return nil, status.Errorf(codes.Aborted, "Volume %s from an earlier attempt failed and was deleted, retry", vol.ID)
+	case services.EvsDeletingStatus:
+		return nil, status.Errorf(codes.Aborted, "Volume %s from an earlier attempt is being deleted, retry", vol.ID)
+	}
+	log.Infof("Volume %s already exists in AZ %s of size %d GiB", vol.ID, vol.AvailabilityZone, vol.Size)
+	return vol, nil
+}
+
+func (cs *ControllerServer) waitCreated(id string) (*cloudvolumes.Volume, error) {
+	var vol *cloudvolumes.Volume
+	err := cs.Driver.poll(func() (bool, error) {
+		v, err := cs.Driver.api.GetVolume(id)
+		if err != nil {
+			return false, err
+		}
+		vol = v
+		return v.Status != services.EvsCreatingStatus, nil
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Error waiting for volume %s to be created: %v", id, err)
+	}
+	return cs.settledVolume(vol)
 }
 
 func checkSnapshotExists(credentials *config.CloudCredentials, content *csi.VolumeContentSource) (string, error) {
@@ -198,6 +306,23 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
+	}
+
+	vol, err := cs.Driver.api.GetVolume(volumeID)
+	if common.IsNotFound(err) {
+		log.Infof("Volume %s does not exist, skip deleting", volumeID)
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch vol.Status {
+	case services.EvsDeletingStatus:
+		log.Infof("Volume %s is already being deleted", volumeID)
+		return &csi.DeleteVolumeResponse{}, nil
+	case services.EvsInUseStatus, services.EvsAttachingStatus, services.EvsDetachingStatus:
+		return nil, status.Errorf(codes.FailedPrecondition, "Volume %s is %s, detach it before deleting",
+			volumeID, vol.Status)
 	}
 
 	if err := cs.Driver.api.DeleteVolume(volumeID); err != nil {

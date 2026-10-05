@@ -177,3 +177,153 @@ func TestControllerPublish(t *testing.T) {
 		})
 	}
 }
+
+const gi = int64(1) << 30
+
+func createReq(name string, required, limit int64, params map[string]string, caps ...*csi.VolumeCapability) *csi.CreateVolumeRequest {
+	if len(caps) == 0 {
+		caps = []*csi.VolumeCapability{rwo()}
+	}
+	r := &csi.CreateVolumeRequest{Name: name, VolumeCapabilities: caps, Parameters: params}
+	if required > 0 || limit > 0 {
+		r.CapacityRange = &csi.CapacityRange{RequiredBytes: required, LimitBytes: limit}
+	}
+	return r
+}
+
+func TestCreateVolume_Sizes(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		required, limit int64
+		wantGB          int
+		want            codes.Code
+	}{
+		{name: "no range: default 10", wantGB: 10},
+		{name: "1Gi rounds up to the EVS minimum", required: gi, wantGB: 10},
+		{name: "10.5Gi rounds up", required: 10*gi + gi/2, wantGB: 11},
+		{name: "32TiB is the maximum", required: 32768 * gi, wantGB: 32768},
+		{name: "above 32TiB", required: 32769 * gi, want: codes.OutOfRange},
+		{name: "limit below the rounded size", required: gi, limit: 5 * gi, want: codes.OutOfRange},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI()
+			d := newFakeDriver(f)
+			resp, err := d.cs.CreateVolume(ctx, createReq("pvc-1", tc.required, tc.limit, nil))
+			wantCode(t, err, tc.want)
+			if tc.want != codes.OK {
+				if f.called("CreateVolume") != 0 {
+					t.Fatal("refused request still created a disk")
+				}
+				return
+			}
+			if f.lastCreate.Volume.Size != tc.wantGB || resp.Volume.CapacityBytes != int64(tc.wantGB)*gi {
+				t.Fatalf("size %d GiB, capacity %d; want %d GiB", f.lastCreate.Volume.Size, resp.Volume.CapacityBytes, tc.wantGB)
+			}
+		})
+	}
+}
+
+func TestCreateVolume_Validation(t *testing.T) {
+	rwx := &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER}}
+	noMode := &csi.VolumeCapability{}
+	for name, req := range map[string]*csi.CreateVolumeRequest{
+		"ReadWriteMany":       createReq("pvc-1", 0, 0, nil, rwx),
+		"missing access mode": createReq("pvc-1", 0, 0, nil, noMode),
+		"tag without =":       createReq("pvc-1", 0, 0, map[string]string{"tags": "a"}),
+		"tag with empty key":  createReq("pvc-1", 0, 0, map[string]string{"tags": "a=b,=c"}),
+		"empty name":          createReq("", 0, 0, nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeAPI()
+			_, err := newFakeDriver(f).cs.CreateVolume(ctx, req)
+			wantCode(t, err, codes.InvalidArgument)
+			if f.called("CreateVolume") != 0 {
+				t.Fatal("invalid request still created a disk")
+			}
+		})
+	}
+}
+
+// Tags and the enterprise project reach EVS; the lookup searches the same project.
+func TestCreateVolume_TagsAndEnterpriseProject(t *testing.T) {
+	f := newFakeAPI()
+	d := newFakeDriver(f)
+	params := map[string]string{"type": "GPSSD", "enterpriseProjectId": "ep-dodai", "tags": " dodai-plane = p1 ,team=db"}
+	if _, err := d.cs.CreateVolume(ctx, createReq("pvc-1", 20*gi, 0, params)); err != nil {
+		t.Fatal(err)
+	}
+	o := f.lastCreate.Volume
+	if o.EnterpriseProjectID != "ep-dodai" || o.Tags["dodai-plane"] != "p1" || o.Tags["team"] != "db" || len(o.Tags) != 2 {
+		t.Fatalf("create opts: ep %q tags %v", o.EnterpriseProjectID, o.Tags)
+	}
+	// a retry finds the disk in that project instead of creating a second one
+	if _, err := d.cs.CreateVolume(ctx, createReq("pvc-1", 20*gi, 0, params)); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.called("CreateVolume"); n != 1 {
+		t.Fatalf("retry created a duplicate: %d creates", n)
+	}
+}
+
+// An earlier attempt's disk with the same name, by state.
+func TestCreateVolume_Existing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing cloudvolumes.Volume
+		onGet    func(v *cloudvolumes.Volume)
+		want     codes.Code
+		creates  int
+		deletes  int
+	}{
+		{name: "available: reused", existing: cloudvolumes.Volume{Name: "pvc-1", Size: 10, Status: "available"}},
+		{name: "creating: waits for it", existing: cloudvolumes.Volume{Name: "pvc-1", Size: 10, Status: "creating"},
+			onGet: statusAfterFirstGet("available")},
+		{name: "creating then error: deleted, retry", existing: cloudvolumes.Volume{Name: "pvc-1", Size: 10, Status: "creating"},
+			onGet: statusAfterFirstGet("error"), want: codes.Aborted, deletes: 1},
+		{name: "error: deleted, retry", existing: cloudvolumes.Volume{Name: "pvc-1", Size: 10, Status: "error"},
+			want: codes.Aborted, deletes: 1},
+		{name: "deleting: retry", existing: cloudvolumes.Volume{Name: "pvc-1", Size: 10, Status: "deleting"}, want: codes.Aborted},
+		{name: "different size", existing: cloudvolumes.Volume{Name: "pvc-1", Size: 20, Status: "available"}, want: codes.AlreadyExists},
+		{name: "fuzzy match only: creates", existing: cloudvolumes.Volume{Name: "pvc-1-other", Size: 10, Status: "available"}, creates: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI()
+			f.add(tc.existing, "")
+			f.onGet = tc.onGet
+			_, err := newFakeDriver(f).cs.CreateVolume(ctx, createReq("pvc-1", 0, 0, nil))
+			wantCode(t, err, tc.want)
+			if c, d := f.called("CreateVolume"), f.called("DeleteVolume"); c != tc.creates || d != tc.deletes {
+				t.Fatalf("creates %d deletes %d, want %d %d", c, d, tc.creates, tc.deletes)
+			}
+		})
+	}
+}
+
+func TestDeleteVolume(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		vol     *cloudvolumes.Volume
+		want    codes.Code
+		deletes int
+	}{
+		{name: "gone", want: codes.OK},
+		{name: "available", vol: &cloudvolumes.Volume{Status: "available"}, deletes: 1},
+		{name: "already deleting", vol: &cloudvolumes.Volume{Status: "deleting"}},
+		{name: "in-use", vol: &cloudvolumes.Volume{Status: "in-use"}, want: codes.FailedPrecondition},
+		{name: "attaching", vol: &cloudvolumes.Volume{Status: "attaching"}, want: codes.FailedPrecondition},
+		{name: "detaching", vol: &cloudvolumes.Volume{Status: "detaching"}, want: codes.FailedPrecondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI()
+			id := "00000000-0000-4000-8000-00000000dead"
+			if tc.vol != nil {
+				id = f.add(*tc.vol, "")
+			}
+			_, err := newFakeDriver(f).cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: id})
+			wantCode(t, err, tc.want)
+			if got := f.called("DeleteVolume"); got != tc.deletes {
+				t.Fatalf("delete calls = %d, want %d", got, tc.deletes)
+			}
+		})
+	}
+}
