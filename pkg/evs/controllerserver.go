@@ -252,6 +252,7 @@ const (
 	VolumeAttachedCurrentServer
 	VolumeAttachedOtherServer
 	VolumeAttachError
+	VolumeDetaching
 )
 
 func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.ControllerPublishVolumeRequest) (
@@ -282,12 +283,15 @@ func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.
 				"Failed to wait for volume: %s attaching ECS: %s with error %v", volumeID, instanceID, err)
 		}
 	case VolumeAttachingOtherServer:
-		return nil, status.Errorf(codes.Internal, "Error, volume: %s is attaching another server", volumeID)
+		return nil, status.Errorf(codes.FailedPrecondition, "Error, volume: %s is attaching another server", volumeID)
 	case VolumeAttachedCurrentServer:
 		log.Infof("ControllerPublishVolume volume: %s already attached on server: %s", volumeID, instanceID)
 		return buildPublishVolumeResponse(volume, instanceID), nil
 	case VolumeAttachedOtherServer:
-		return nil, status.Errorf(codes.Internal, "Error, volume: %s is in used by another server", volumeID)
+		return nil, status.Errorf(codes.FailedPrecondition, "Error, volume: %s is in used by another server", volumeID)
+	case VolumeDetaching:
+		return nil, status.Errorf(codes.FailedPrecondition, "Error, volume: %s is detaching, retry once it is available",
+			volumeID)
 	default:
 		return nil, status.Errorf(codes.Internal, "Error, status: %s was found in volume: %s, ",
 			volume.Status, volume.ID)
@@ -317,15 +321,12 @@ func buildPublishVolumeResponse(volume *cloudvolumes.Volume, instanceID string) 
 }
 
 func volumeAttachmentStatus(volume *cloudvolumes.Volume, instanceID string) VolumeAttachmentStatus {
-	attachment := false // use to decide whether volume has attached on current instance
-	for _, v := range volume.Attachments {
-		if v.ServerID == instanceID {
-			attachment = true
-			break
-		}
-	}
+	attachment := attachedTo(volume, instanceID) // whether volume has attached on current instance
 
 	volumeStatus := volume.Status
+	if services.EvsDetachingStatus == volumeStatus {
+		return VolumeDetaching
+	}
 	if services.EvsAvailableStatus == volumeStatus {
 		return VolumeNotAttached
 	}

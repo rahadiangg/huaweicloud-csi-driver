@@ -132,3 +132,48 @@ func statusAfterFirstGet(s string) func(v *cloudvolumes.Volume) {
 		}
 	}
 }
+
+// Publish: a volume busy on another node is a FailedPrecondition (the attacher retries), not Internal.
+func TestControllerPublish(t *testing.T) {
+	at := func(status, server string) *cloudvolumes.Volume {
+		v := &cloudvolumes.Volume{Status: status, Size: 10}
+		if server != "" {
+			v.Attachments = []cloudvolumes.Attachment{{ServerID: server, Device: "/dev/vdb"}}
+		}
+		return v
+	}
+	for _, tc := range []struct {
+		name    string
+		vol     *cloudvolumes.Volume
+		node    string
+		want    codes.Code
+		attachs int
+	}{
+		{name: "available: attach", vol: at("available", ""), node: "node-a", want: codes.OK, attachs: 1},
+		{name: "already in-use here: idempotent", vol: at("in-use", "node-a"), node: "node-a", want: codes.OK},
+		{name: "attaching here: wait", vol: at("attaching", "node-a"), node: "node-a", want: codes.OK},
+		{name: "in-use elsewhere", vol: at("in-use", "node-b"), node: "node-a", want: codes.FailedPrecondition},
+		{name: "attaching elsewhere", vol: at("attaching", "node-b"), node: "node-a", want: codes.FailedPrecondition},
+		{name: "detaching elsewhere", vol: at("detaching", "node-b"), node: "node-a", want: codes.FailedPrecondition},
+		{name: "detaching here", vol: at("detaching", "node-a"), node: "node-a", want: codes.FailedPrecondition},
+		{name: "volume in error", vol: at("error", ""), node: "node-a", want: codes.Internal},
+		{name: "volume gone", node: "node-a", want: codes.NotFound},
+		{name: "server gone", vol: at("available", ""), node: "node-x", want: codes.NotFound},
+		{name: "empty node id", vol: at("available", ""), node: "", want: codes.InvalidArgument},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI("node-a", "node-b")
+			id := "00000000-0000-4000-8000-00000000dead"
+			if tc.vol != nil {
+				id = f.add(*tc.vol, "")
+			}
+			d := newFakeDriver(f)
+			_, err := d.cs.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+				VolumeId: id, NodeId: tc.node, VolumeCapability: rwo()})
+			wantCode(t, err, tc.want)
+			if got := f.called("AttachVolume"); got != tc.attachs {
+				t.Fatalf("attach calls = %d, want %d", got, tc.attachs)
+			}
+		})
+	}
+}
