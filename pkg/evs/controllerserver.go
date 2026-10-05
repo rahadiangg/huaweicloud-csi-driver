@@ -40,6 +40,11 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if err := createVolumeValidation(volName, req.GetVolumeCapabilities()); err != nil {
 		return nil, err
 	}
+	unlock, err := cs.lock(volName)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	sizeGB, err := requestedSizeGB(req.GetCapacityRange())
 	if err != nil {
@@ -307,6 +312,11 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, volume ID cannot be empty")
 	}
+	unlock, err := cs.lock(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	vol, err := cs.Driver.api.GetVolume(volumeID)
 	if common.IsNotFound(err) {
@@ -389,6 +399,11 @@ func (cs *ControllerServer) ControllerPublishVolume(_ context.Context, req *csi.
 	if err := publishValidation(api, volumeID, instanceID, req.GetVolumeCapability()); err != nil {
 		return nil, err
 	}
+	unlock, err := cs.lock(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	volume, err := api.GetVolume(volumeID)
 	if err != nil {
 		return nil, err
@@ -500,6 +515,11 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, req *cs
 	if len(instanceID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Validation failed, ECS instance ID cannot be empty")
 	}
+	unlock, err := cs.lock(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	if err := cs.unpublish(volumeID, instanceID); err != nil {
 		return nil, err
@@ -846,6 +866,11 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 	if err != nil {
 		return nil, err
 	}
+	unlock, err := cs.lock(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	volume, err := cs.Driver.api.GetVolume(volumeID)
 	if err != nil {

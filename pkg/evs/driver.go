@@ -36,6 +36,7 @@ type EvsDriver struct { //nolint: revive
 	cloudCredentials *config.CloudCredentials
 	api              evsAPI
 	poll             func(wait.ConditionFunc) error // waits on EVS state; fast in tests
+	locks            volumeLocks
 
 	ids *identityServer
 	cs  *ControllerServer
